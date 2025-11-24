@@ -1,0 +1,101 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
+from IPython.display import Image, display
+import pandas as pd
+import os
+
+# Parameters (editable)
+
+R = 5.0              # cylinder radius
+rate = 0.1          # growth rate at theta=0
+total_time = 5.0     # seconds
+fps = 15             # frames per second
+m = 1              # angular broadening exponent
+
+# Derived values
+
+frames = int(total_time * fps) + 1
+theta = np.linspace(-np.pi, np.pi, 600)       # θ domain
+mask = np.abs(theta) <= (np.pi / 2)           # illuminated half
+profile = np.zeros_like(theta)
+profile[mask] = np.cos(theta[mask]) ** m
+
+# Figure setup (polar)
+fig = plt.figure(figsize=(5.5, 5.5))
+ax = fig.add_subplot(111, projection="polar")
+
+# Polar orientation: 0° at North (top), CCW positive
+ax.set_theta_zero_location("N")
+ax.set_theta_direction(1)  # CCW
+
+# Initial lines (no labels to avoid legend)
+r0 = R + 0 * profile
+line_profile, = ax.plot(theta, r0, linewidth=2)
+ax.plot(theta, np.full_like(theta, R), linestyle="--", linewidth=1)
+
+# Limits and labels
+ax.set_ylim(0, R + rate * total_time * 1.25)
+ax.set_title("Cylindrical Deposition: t = 0.00 s", pad=28)  # move title up
+# Remove radial tick labels (hide "thickness" labels)
+ax.set_yticklabels([])
+
+# Animation function
+def update(frame):
+    t = frame / fps
+    r = R + (rate * t) * profile
+    line_profile.set_data(theta, r)
+    ax.set_title(f"Cylindrical Deposition: t = {t:0.2f} s", pad=28)
+    return (line_profile,)
+
+anim = FuncAnimation(fig, update, frames=frames, interval=1000/fps, blit=True)
+
+# Save animation (GIF)
+out_dir = "/mnt/data"
+os.makedirs(out_dir, exist_ok=True)
+gif_path = os.path.join(out_dir, "deposition_rotated.gif")
+
+saved_gif = False
+try:
+    anim.save(gif_path, writer=PillowWriter(fps=fps))
+    saved_gif = True
+except Exception as e:
+    print("Could not save GIF animation:", e)
+
+plt.close(fig)
+
+# Display GIF inline if saved
+if saved_gif:
+    display(Image(filename=gif_path))
+
+# Save final profile (CSV) and last-frame PNG
+angles_deg = np.degrees(theta)  # -180..+180 (0° is North in display)
+final_thickness = (rate * total_time) * profile
+
+df = pd.DataFrame({
+    "theta_deg": angles_deg,
+    "thickness": final_thickness
+})
+
+csv_path = os.path.join(out_dir, "final_thickness_profile_rotated.csv")
+df.to_csv(csv_path, index=False)
+
+# Final still image
+fig2 = plt.figure(figsize=(5.5, 5.5))
+ax2 = fig2.add_subplot(111, projection="polar")
+ax2.set_theta_zero_location("N")
+ax2.set_theta_direction(1)
+r_final = R + final_thickness
+ax2.plot(theta, r_final, linewidth=2)
+ax2.plot(theta, np.full_like(theta, R), linestyle="--", linewidth=1)
+ax2.set_ylim(0, R + rate * total_time * 1.25)
+ax2.set_title("Simulated Deposition", pad=28)
+ax2.set_yticklabels([])  # hide radial tick labels
+png_path = os.path.join(out_dir, "deposition_final_rotated.png")
+plt.savefig(png_path, dpi=144, bbox_inches="tight")
+plt.close(fig2)
+
+print("Files generated:")
+print("GIF animation:", gif_path if saved_gif else "(failed to save)")
+print("Final profile CSV:", csv_path)
+print("Final still PNG:", png_path)
