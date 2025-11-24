@@ -1,0 +1,163 @@
+# --- Ω_wire Calculator with angular flux constraint ---
+# Updates Ω-wire denominator to:
+#   F(α) * (2*K*t/D^2) * (1 + (3πR)/(4D)) - ((3-3P)/8)*π*l0      [neglecting O(R^2/D^2)]
+#
+# Keeps angular model and K-from-f_max logic:
+#   f(t, θ) = K t * ((D + R sinθ)^n * (-R - D sinθ)) / (R^2 + D^2 + 2 R D sinθ)^((n+3)/2)
+#   K = f_max * (D - R)**2 / t  from θ = 3π/2
+#
+# Edit the "inputs" and "missing" below, then run.
+
+import math
+from sympy import symbols, Eq, solve, nsolve, pi
+
+# -------------------------------
+# F(alpha)
+# -------------------------------
+def F_alpha(l0, r_gb, a_g):
+    if not (0 < r_gb < 1):
+        raise ValueError("r_gb must be between 0 and 1 (exclusive).")
+    if a_g <= 0 or l0 <= 0:
+        raise ValueError("a_g and l0 must be positive.")
+    x = (l0 * r_gb) / (a_g * (1 - r_gb))
+    return 1 - 1.5*x + 3*x**2 - 3*(x**3)*math.log(1 + 1/x)
+
+# -------------------------------
+# Angular flux model f(t, θ)
+# -------------------------------
+def f_theta(K, t, D, R, n, theta):
+    num = (D + R*math.sin(theta))**n * (-R - D*math.sin(theta))
+    den = (R**2 + D**2 + 2*R*D*math.sin(theta))**((n+3)/2)
+    return K * t * num / den
+
+def K_from_fmax(f_max, t, D, R):
+    """
+    Using θ = 3π/2 => sinθ = -1, the expression simplifies to:
+      f_max = K * t / (D - R)^2   ⇒   K = f_max * (D - R)**2 / t
+    (Independent of n; valid for any n because powers cancel.)
+    """
+    if t == 0:
+        raise ValueError("t must be nonzero to compute K from f_max.")
+    return f_max * (D - R)**2 / t
+
+# -------------------------------
+# Core solver for Ω equation
+# -------------------------------
+def solve_missing(missing_var, **kwargs):
+    # Compute K from f_max if needed
+    if (kwargs.get("K") is None) and (kwargs.get("f_max") is not None):
+        kwargs["K"] = K_from_fmax(kwargs["f_max"], kwargs["t"], kwargs["D"], kwargs["R"])
+
+    # Sanity: either K provided or computable from f_max
+    if kwargs.get("K") is None:
+        raise ValueError("K is unknown. Provide either K directly or f_max to infer K.")
+
+    # Symbols and equation
+    Omega, L, rho0, R, K, t, D, P, l0 = symbols("Omega L rho0 R K t D P l0", real=True)
+    F_val = F_alpha(kwargs["l0"], kwargs["r_gb"], kwargs["a_g"])
+
+    # ---- UPDATED FORMULA HERE ----
+    expr = (L*rho0) / (
+        R * (
+            F_val * (2*K*t/D**2) * (1 + 3*pi*R/(4*D))   # <-- changed πR/(4D) → 3πR/(4D)
+            - ((3 - 3*P)/8) * pi * l0                   # <-- algebraic form of 3*(1-P)/8
+        )
+    )
+    # ------------------------------
+
+    eq = Eq(Omega, expr)
+
+    # Substitutions for knowns
+    subs = {}
+    for k in ["Omega","L","rho0","R","K","t","D","P","l0"]:
+        if kwargs.get(k) is not None:
+            subs[eval(k)] = float(kwargs[k])
+
+    target = eval(missing_var)
+
+    # Gentle check for R << D assumption (we're neglecting O(R^2/D^2))
+    if ("R" in [str(s) for s in subs.keys()]) and ("D" in [str(s) for s in subs.keys()]):
+        Rv = float(subs[R]); Dv = float(subs[D])
+        if Dv <= 0: raise ValueError("D must be positive.")
+        if Rv <= 0: raise ValueError("R must be positive.")
+        if Rv/Dv > 0.1:
+            print(f"Warning: R/D = {Rv/Dv:.3f} (R << D assumption may be violated; "
+                  "higher-order O(R^2/D^2) terms neglected).")
+
+    # Try analytic solve first
+    try:
+        sol_sym = solve(eq.subs(subs), target, dict=True)
+        real_vals = []
+        for s in sol_sym:
+            val = s.get(target, None)
+            if val is not None and val.is_real:
+                vf = float(val.evalf())
+                real_vals.append(vf)
+        if real_vals:
+            positives = [v for v in real_vals if v > 0]
+            return min(positives) if positives else real_vals[0]
+    except Exception:
+        pass
+
+    # Numeric fallback
+    guess = 1.0
+    if missing_var in {"R","D","l0"}: guess = 1e-3
+    elif missing_var in {"K"}: guess = 1e-9
+    elif missing_var in {"t"}: guess = 100.0
+    elif missing_var in {"Omega"}: guess = 1.0
+    elif missing_var in {"P"}: guess = 0.5
+    elif missing_var in {"L"}: guess = 0.1
+    elif missing_var in {"rho0"}: guess = 1e-6
+
+    root = nsolve(eq.subs(subs), target, guess, tol=1e-14, maxsteps=200)
+    return float(root)
+
+# -------------------------------
+# INPUTS (Input appropriate material parameters here)
+# -------------------------------
+inputs = {
+    # Primary Ω equation variables (set one to None if it's the one you want to solve for):
+    "Omega": None,     # leave None to solve for it
+    "L": 6e-2,          # wire length [m]
+    "f_max": 1220e-9,    # known maximum thickness at θ = 3π/2  [units consistent with f]
+    "R": 55e-6,         # wire radius [m]
+
+    # Microstructure for F(α):
+    "r_gb": 0.30,       # grain boundary reflection constant
+    "a_g": 310e-9,       # material crystalline size [m]
+
+    # Constants
+    "rho0": 2.44e-8,      # bulk resistivity [Ω·m]
+    "K": None,         # emission rate constant [m^3/s]; leave None to compute from f_max
+    "t": 3600,         # time [s]
+    "P": 0.1,         # specular scattering fraction
+    "l0": 30e-9,      # mean free path of electrons [m]
+    "D": 67e-2,         # source distance [m]
+
+    # Angular flux model parameters:
+    "n": 2.0,          # emission exponent in f(t, θ)
+}
+
+# -------------------------------
+# Choose which variable to solve for
+# -------------------------------
+missing = "Omega"   # Options: "Omega","L","rho0","R","K","t","D","P","l0"
+
+# -------------------------------
+# Compute K from f_max if needed (and show it)
+# -------------------------------
+if inputs.get("K") is None and inputs.get("f_max") is not None:
+    K_calc = K_from_fmax(inputs["f_max"], inputs["t"], inputs["D"], inputs["R"])
+    print(f"Computed K from f_max: {K_calc:.6e} [m^3/s]")
+    inputs["K"] = K_calc
+
+# Optional: verify f_max using the angular model at θ=3π/2
+theta_star = 1.5*math.pi
+f_check = f_theta(inputs["K"], inputs["t"], inputs["D"], inputs["R"], inputs["n"], theta_star)
+print(f"Check f(t, 3π/2) from K: {f_check:.6e} (target f_max = {inputs['f_max']:.6e})")
+
+# -------------------------------
+# Solve for the requested variable
+# -------------------------------
+ans = solve_missing(missing, **inputs)
+print(f"Solved {missing} = {ans:.6e}")
