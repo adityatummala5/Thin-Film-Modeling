@@ -1,0 +1,383 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import os
+import pandas as pd
+from scipy.ndimage import gaussian_filter
+
+# =========================
+# Geometry & parameters
+# =========================
+
+# Cylinder (axis along X)
+cylinder_center = np.array([0.0, 0.0, 50.0])   # [units: mm]
+cylinder_length = 20.0                         # along x [mm]
+cylinder_radius = 0.05                         # [mm]
+
+# Source at S = (0, -D, z_c), normal +y or +j
+D = 50.0                                       # [mm]
+source_3d = np.array([0.0, -D, cylinder_center[2]])
+
+# Emission directionality exponent: n=1 is Lambertian; larger n = more directional
+n = 2
+
+# Monte Carlo controls
+N_total_3d = 5_000_000_000       # total macro particles to simulate
+chunk_size = 50_000_000      # processed in chunks to limit RAM usage
+rng = np.random.default_rng(7)
+
+# Sticking Probability [0, 1]
+sticking_S = 1.0
+
+# Material Parameters (Au)
+M_kg_per_mol = 0.19696657       # kg/mol
+rho_kg_per_m3 = 19320.0         # kg/m^3
+N_A = 6.02214076e23             # 1/mol
+V_atom_m3 = (M_kg_per_mol / rho_kg_per_m3) / N_A  # ~1.69e-29 m^3/atom
+
+# Macro-Particle Calibration.
+atoms_per_ray = 1.0   # Hard setpoint for real atoms/macroparticle
+
+calibrate_to_reference = True # calibration atoms_per_ray so the bin at (θ=3π/2, x=0) has a known thickness.
+reference_thickness_nm = 100.0  # only used if calibrate_to_reference=True; deposition setpoint
+
+# Bin setup for calculating f(t, 3pi/2) - f_max
+peak_avg_halfwidth_theta = 1    # average ± this many bins in θ
+peak_avg_halfwidth_x = 1        # average ± this many bins in x
+include_center_in_peak_avg = False  # average neighbors only (exclude center peak bin)
+
+print(f"Source position: {source_3d}")
+print(f"Cylinder center: {cylinder_center}")
+print(f"Cylinder length: {cylinder_length} mm")
+print(f"Cylinder radius: {cylinder_radius} mm")
+print(f"Emission exponent n: {n}")
+print(f"[debug] Gold per-atom volume V_atom_m3 = {V_atom_m3:.3e} m^3/atom")
+print(f"\nGenerating and tracing {N_total_3d} rays-atoms in chunks of {chunk_size}.\n")
+
+# =========================
+# Ray Casting Parameters
+# =========================
+
+# Cylinder x-extent in cylinder-centered coordinates
+x_min_cyl_rel = -cylinder_length / 2.0
+x_max_cyl_rel =  cylinder_length / 2.0
+
+# Precompute source position relative to cylinder center
+S_rel = source_3d - cylinder_center
+Sx_rel, Sy_rel, Sz_rel = S_rel
+
+all_impact_points_3d = []
+
+for i0 in range(0, N_total_3d, chunk_size):
+    N_chunk = min(chunk_size, N_total_3d - i0)
+    print(f"  Chunk starting at {i0:,}  (N={N_chunk:,})")
+
+    # Sampling directions from cos^n(psi) hemisphere about +j
+    U = rng.random(N_chunk)
+    cos_psi = U ** (1.0 / (n + 1.0))
+    sin_psi = np.sqrt(np.maximum(0.0, 1.0 - cos_psi**2))
+    alpha = 2.0 * np.pi * rng.random(N_chunk)
+
+    # Hemisphere oriented along +y --> direction vector:
+    dx = sin_psi * np.cos(alpha)
+    dy = cos_psi
+    dz = sin_psi * np.sin(alpha)
+    dirs_3d_chunk = np.column_stack((dx, dy, dz))  # shape (N_chunk, 3)
+
+    # Ray-cylinder intersection (axis || x) in cylinder-centered frame
+
+    # x limits (finite cylinder)
+    t_x1 = np.full(N_chunk, np.nan)
+    t_x2 = np.full(N_chunk, np.nan)
+    not_parallel_to_x = ~np.isclose(dx, 0.0)
+    t_x1[not_parallel_to_x] = (x_min_cyl_rel - Sx_rel) / dx[not_parallel_to_x]
+    t_x2[not_parallel_to_x] = (x_max_cyl_rel - Sx_rel) / dx[not_parallel_to_x]
+
+    t_x_enter = np.full(N_chunk, -np.inf)
+    t_x_exit  = np.full(N_chunk,  np.inf)
+    t_x_enter[not_parallel_to_x] = np.minimum(t_x1[not_parallel_to_x], t_x2[not_parallel_to_x])
+    t_x_exit[not_parallel_to_x]  = np.maximum(t_x1[not_parallel_to_x], t_x2[not_parallel_to_x])
+
+    parallel_to_x = ~not_parallel_to_x
+    outside_x_bounds_parallel_x = parallel_to_x & ((Sx_rel < x_min_cyl_rel) | (Sx_rel > x_max_cyl_rel))
+
+    # Infinite cylinder in the yz-plane: (y^2 + z^2 = R^2)
+    a = dy**2 + dz**2
+    b = 2.0 * (Sy_rel * dy + Sz_rel * dz)
+    c = Sy_rel**2 + Sz_rel**2 - cylinder_radius**2
+
+    parallel_to_yz = np.isclose(a, 0.0)
+
+    t1_inf = np.full(N_chunk, np.nan)
+    t2_inf = np.full(N_chunk, np.nan)
+
+    not_parallel_to_yz = ~parallel_to_yz
+    disc = b**2 - 4.0 * a * c
+    valid_disc_mask = not_parallel_to_yz & (disc >= 0.0)
+
+    sqrt_disc = np.sqrt(disc[valid_disc_mask])
+    t1_inf[valid_disc_mask] = (-b[valid_disc_mask] - sqrt_disc) / (2.0 * a[valid_disc_mask])
+    t2_inf[valid_disc_mask] = (-b[valid_disc_mask] + sqrt_disc) / (2.0 * a[valid_disc_mask])
+
+    # Rays parallel to yz (a~0): along x. If within radius and within x-bounds, they "hit" along [t_enter, t_exit].
+    dist_to_axis_sq_yz = Sy_rel**2 + Sz_rel**2
+    within_radius_yz_parallel_yz = parallel_to_yz & (dist_to_axis_sq_yz <= cylinder_radius**2)
+    valid_parallel_yz_hit = within_radius_yz_parallel_yz & ~outside_x_bounds_parallel_x
+    t1_inf[valid_parallel_yz_hit] = np.maximum(0.0, t_x_enter[valid_parallel_yz_hit])
+
+    # Intersect with finite x-interval
+    valid_t1_mask = (t1_inf >= 0.0) & (t1_inf >= t_x_enter) & (t1_inf <= t_x_exit)
+    valid_t2_mask = (t2_inf >= 0.0) & (t2_inf >= t_x_enter) & (t2_inf <= t_x_exit)
+
+    ray_hits_mask_chunk = valid_t1_mask | valid_t2_mask
+    ray_hits_mask_chunk[outside_x_bounds_parallel_x] = False
+
+    # Chooses the first positive intersection (entry point)
+    t_hit_chunk = np.full(N_chunk, np.nan)
+    t_hit_chunk[valid_t1_mask & ~valid_t2_mask] = t1_inf[valid_t1_mask & ~valid_t2_mask]
+    t_hit_chunk[valid_t2_mask & ~valid_t1_mask] = t2_inf[valid_t2_mask & ~valid_t1_mask]
+    both_valid_mask = valid_t1_mask & valid_t2_mask
+    t_hit_chunk[both_valid_mask] = np.minimum(t1_inf[both_valid_mask], t2_inf[both_valid_mask])
+
+    # Impact points (world coordinates)
+    actual_hits_mask_chunk = ~np.isnan(t_hit_chunk)
+    impact_points_3d_chunk = source_3d + t_hit_chunk[actual_hits_mask_chunk, np.newaxis] * dirs_3d_chunk[actual_hits_mask_chunk, :]
+
+    # Collect and Cleanup
+    all_impact_points_3d.append(impact_points_3d_chunk)
+    del dirs_3d_chunk, dx, dy, dz, t_x1, t_x2, t_x_enter, t_x_exit, t1_inf, t2_inf, t_hit_chunk
+    del not_parallel_to_x, parallel_to_x, outside_x_bounds_parallel_x, a, b, c, parallel_to_yz, not_parallel_to_yz, valid_disc_mask, sqrt_disc
+    del ray_hits_mask_chunk, both_valid_mask, actual_hits_mask_chunk
+
+# Concatenate all hits
+impact_points_3d = np.concatenate(all_impact_points_3d, axis=0) if all_impact_points_3d else np.empty((0,3))
+del all_impact_points_3d
+
+print(f"\nFinished.\nTotal rays/atoms emitted: {N_total_3d:,}")
+print(f"Total hits on cylinder (atoms deposited): {len(impact_points_3d):,}")
+
+# =========================
+# Bin hits
+# =========================
+
+if len(impact_points_3d) == 0:
+    print("No hits recorded; try increasing N_total_3d or reducing D.")
+else:
+    # Transform to cylinder-centered coordinates
+    rel = impact_points_3d - cylinder_center
+    x_hit = rel[:, 0]                 # axial coordinate along x [mm]
+    y_rel = rel[:, 1]
+    z_rel = rel[:, 2]
+
+    # Angle θ in yz-plane: θ = atan2(y, z); returns in (-π, π]
+    theta_hit = np.arctan2(y_rel, z_rel)
+
+    # Map to [0, 2π)
+    theta_hit_02pi = np.where(theta_hit < 0, theta_hit + 2*np.pi, theta_hit)
+
+    # Keep only θ in [π, 2π]
+    mask_theta = (theta_hit_02pi >= np.pi) & (theta_hit_02pi <= 2*np.pi)
+    theta_use = theta_hit_02pi[mask_theta]
+    x_use = x_hit[mask_theta]
+
+    # Bin edges (θ only over [π, 2π])
+    n_theta_bins = 72
+    n_x_bins = 60
+    theta_bins = np.linspace(np.pi, 2*np.pi, n_theta_bins + 1)
+    x_bins = np.linspace(-cylinder_length/2.0, cylinder_length/2.0, n_x_bins + 1)
+
+    # 2D histogram: counts[θ_bin, x_bin]  (== hits per bin)
+    counts, theta_edges, x_edges = np.histogram2d(theta_use, x_use, bins=[theta_bins, x_bins])
+    counts = counts.astype(float)
+    print("Histogram shape (θ bins, x bins):", counts.shape)
+
+    # Bin surface area A_ij = R * dθ_i * dx_j   [mm^2]
+    dtheta = np.diff(theta_edges)                    # (n_theta_bins,)
+    dx = np.diff(x_edges)                            # (n_x_bins,)
+    A_bin_mm2 = cylinder_radius * dtheta[:, None] * dx[None, :]
+    A_bin_m2  = A_bin_mm2 * 1e-6
+    print(f"[debug] Example bin area: min={np.nanmin(A_bin_m2):.3e} m^2, max={np.nanmax(A_bin_m2):.3e} m^2")
+
+    # -------------------------
+    # Optional calibration step
+    # -------------------------
+    # Identify reference bin indices for θ=3π/2, x=0 (mid-span south)
+    target_theta = 1.5 * np.pi  # 3π/2
+    target_x = 0.0              # cylinder mid-span
+
+    theta_idx = np.searchsorted(theta_edges, target_theta, side='right') - 1
+    theta_idx = int(np.clip(theta_idx, 0, len(theta_edges) - 2))
+
+    x_idx = np.searchsorted(x_edges, target_x, side='right') - 1
+    x_idx = int(np.clip(x_idx, 0, len(x_edges) - 2))
+
+    if calibrate_to_reference:
+        # Define a neighborhood around θ=3π/2, x=0
+        th0 = max(theta_idx - peak_avg_halfwidth_theta, 0)
+        th1 = min(theta_idx + peak_avg_halfwidth_theta + 1, counts.shape[0])
+        x0  = max(x_idx     - peak_avg_halfwidth_x,      0)
+        x1  = min(x_idx     + peak_avg_halfwidth_x + 1,  counts.shape[1])
+
+        window_counts = counts[th0:th1, x0:x1].astype(float).copy()
+        window_area   = A_bin_m2[th0:th1, x0:x1].astype(float).copy()
+
+        # Optionally exclude the exact center bin from the neighborhood average
+        if not include_center_in_peak_avg:
+            cth = theta_idx - th0
+            cx  = x_idx - x0
+            if 0 <= cth < window_counts.shape[0] and 0 <= cx < window_counts.shape[1]:
+                window_counts[cth, cx] = 0.0
+                window_area[cth, cx]   = 0.0
+
+        # Sum hits and area over neighbor bins to form an average thickness target
+        hits_sum = float(np.nansum(window_counts))
+        area_sum = float(np.nansum(window_area))
+
+        if hits_sum <= 0.0 or area_sum <= 0.0:
+            print("[warn] Neighbor region has no hits/area; falling back to center bin calibration.")
+            N_hits_ref = counts[theta_idx, x_idx]
+            if N_hits_ref <= 0:
+                print("[warn] Center bin also has zero hits; skipping calibration.")
+            else:
+                t_ref_m  = reference_thickness_nm * 1e-9
+                A_ref_m2 = A_bin_m2[theta_idx, x_idx]
+                atoms_per_ray = (t_ref_m * A_ref_m2) / (sticking_S * V_atom_m3 * N_hits_ref)
+                print(f"[calibration:center] atoms_per_ray = {atoms_per_ray:.6e} "
+                      f"to achieve {reference_thickness_nm} nm at center bin.")
+        else:
+            # Average thickness over neighbors:  t_ref = s * V_atom * atoms_per_ray * (hits_sum / area_sum)
+            t_ref_m = reference_thickness_nm * 1e-9
+            atoms_per_ray = t_ref_m / (sticking_S * V_atom_m3 * (hits_sum / area_sum))
+            used_bins = int(np.count_nonzero(window_area))
+            print(f"[calibration:neighbors] Using {used_bins} bins around θ=3π/2, x=0")
+            print(f"  hits_sum = {hits_sum:.6e}, area_sum = {area_sum:.6e} m^2")
+            print(f"  atoms_per_ray set to {atoms_per_ray:.6e} "
+                  f"to achieve {reference_thickness_nm} nm average in neighborhood.")
+
+
+    # =========================
+    # Thickness from hits + volume conservation
+    # =========================
+    counts_physical = counts * atoms_per_ray
+    atoms_per_m2 = counts_physical / A_bin_m2                       # atoms / m^2
+    thickness_m  = sticking_S * atoms_per_m2 * V_atom_m3            # meters
+    thickness_nm = thickness_m * 1e9
+    thickness_mm = thickness_m * 1e3
+
+
+    # Report maxima
+    max_nm = float(np.nanmax(thickness_nm))
+    max_mm = float(np.nanmax(thickness_mm))
+    print(f"\n[Physics] Max deposited thickness (raw peak bin): {max_nm:.6e} nm  ({max_mm:.6e} mm)")
+
+    # Report the bin with maximum thickness
+    imax = np.nanargmax(thickness_nm)
+    i_th, i_x = np.unravel_index(imax, thickness_nm.shape)
+
+    theta_center_max = 0.5 * (theta_edges[i_th] + theta_edges[i_th + 1])
+    x_center_max     = 0.5 * (x_edges[i_x] + x_edges[i_x + 1])
+
+    hits_in_max_bin      = counts[i_th, i_x]                 # raw Monte Carlo hits
+    atoms_in_max_bin     = counts_physical[i_th, i_x]        # hits scaled by atoms_per_ray
+    A_max_m2             = A_bin_m2[i_th, i_x]
+    t_max_nm             = thickness_nm[i_th, i_x]
+    areal_atoms_per_m2   = atoms_in_max_bin / A_max_m2
+
+    print("\n[Max-thickness bin]")
+    print(f"  center: θ={theta_center_max:.5f} rad, x={x_center_max:.5f} mm")
+    print(f"  hits: {int(hits_in_max_bin):,}  |  atoms ≈ {atoms_in_max_bin:.6e}")
+    print(f"  area: {A_max_m2:.3e} m^2  |  atoms/m^2 ≈ {areal_atoms_per_m2:.6e}")
+    print(f"  thickness: {t_max_nm:.6e} nm")
+
+
+    # =========================
+    # Max thickness: x=0, θ=3π/2 (south, mid-span)
+    # =========================
+    # Neighborhood slices (clamped to edges)
+    th0 = max(theta_idx - peak_avg_halfwidth_theta, 0)
+    th1 = min(theta_idx + peak_avg_halfwidth_theta + 1, thickness_nm.shape[0])
+    x0  = max(x_idx     - peak_avg_halfwidth_x,      0)
+    x1  = min(x_idx     + peak_avg_halfwidth_x + 1,  thickness_nm.shape[1])
+
+    # Extract local thickness (nm) patch around the target
+    local_patch_nm = thickness_nm[th0:th1, x0:x1].astype(float).copy()
+
+    # Optionally exclude the exact center bin from the neighborhood average
+    if not include_center_in_peak_avg:
+        ctheta = theta_idx - th0
+        cx     = x_idx - x0
+        if 0 <= ctheta < local_patch_nm.shape[0] and 0 <= cx < local_patch_nm.shape[1]:
+            local_patch_nm[ctheta, cx] = np.nan
+
+    # Robust average in nm; fallback to center bin if neighborhood is empty
+    if np.all(np.isnan(local_patch_nm)):
+        robust_nm = float(thickness_nm[theta_idx, x_idx])
+    else:
+        robust_nm = float(np.nanmean(local_patch_nm))
+
+    robust_mm = robust_nm / 1e6
+
+    # Also report the center-bin value at the target (for reference)
+    center_nm = float(thickness_nm[theta_idx, x_idx])
+    center_mm = center_nm / 1e6
+
+    # Bin-center coordinates for readability
+    target_theta_center = 0.5 * (theta_edges[theta_idx] + theta_edges[theta_idx + 1])
+    target_x_center     = 0.5 * (x_edges[x_idx] + x_edges[x_idx + 1])
+
+    print(f"[Fixed @ θ=3π/2, x=0] bin centers: θ={target_theta_center:.5f} rad, x={target_x_center:.5f} mm")
+    print(f"[Fixed] Center-bin thickness: {center_nm:.6e} nm  ({center_mm:.6e} mm)")
+    print(f"[Fixed] Neighbor-avg thickness (θ±{peak_avg_halfwidth_theta}, x±{peak_avg_halfwidth_x}): "
+          f"{robust_nm:.6e} nm  ({robust_mm:.6e} mm)")
+
+    # =========================
+    # Saving data
+    # =========================
+    theta_centers = 0.5 * (theta_edges[:-1] + theta_edges[1:])
+    x_centers     = 0.5 * (x_edges[:-1] + x_edges[1:])
+    Theta_flat = np.tile(theta_centers, len(x_centers))
+    X_flat     = np.repeat(x_centers, len(theta_centers))
+    thick_nm_flat = thickness_nm.T.ravel()  # (x, θ) order
+    thick_mm_flat = thickness_mm.T.ravel()
+
+    out_dir = "/mnt/data"
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path_thick = os.path.join(out_dir, "mc_deposition_thickness_theta_x_PI_to_2PI.csv")
+    pd.DataFrame({
+        "theta_center_rad": Theta_flat,
+        "x_center_mm": X_flat,
+        "thickness_nm": thick_nm_flat,
+        "thickness_mm": thick_mm_flat
+    }).to_csv(csv_path_thick, index=False)
+    print(f"Saved physical thickness (nm & mm) to: {csv_path_thick}")
+
+    # =========================
+    # Plot
+    # =========================
+    plot_sigma = 0  # gaussian smoothing --> 0 = no smoothing, 1-2 for light smoothing
+    if plot_sigma and plot_sigma > 0:
+        thickness_nm_plot = gaussian_filter(thickness_nm, sigma=[plot_sigma, plot_sigma])
+    else:
+        thickness_nm_plot = thickness_nm
+
+    Theta_plot, X_plot = np.meshgrid(theta_centers, x_centers)
+    Z_plot = thickness_nm_plot.T  # (x_bins-1, θ_bins-1)
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    surf = ax.plot_surface(Theta_plot, X_plot, Z_plot, cmap='viridis')
+
+    ax.set_xlabel('Angle θ (rad)  [π → 2π]')
+    ax.set_ylabel('Axial position x (mm)')
+    ax.set_zlabel('Thickness (nm)')
+    ax.set_xlim(np.pi, 2*np.pi)
+    ax.set_xticks([np.pi, 1.5*np.pi, 2*np.pi])
+    ax.set_xticklabels([r'$\pi$', r'$3\pi/2$', r'$2\pi$'])
+
+    cbar = fig.colorbar(surf, shrink=0.55, aspect=16)
+    cbar.set_label('Thickness (nm)')
+
+    plot_path = os.path.join(out_dir, "mc_deposition_thickness_surface_PI_to_2PI_nm.png")
+    fig.savefig(plot_path, bbox_inches="tight", dpi=144)
+    plt.close(fig)
+    print(f"Saved thickness surface plot (θ in[π,2π], Z in nm) to: {plot_path}")
