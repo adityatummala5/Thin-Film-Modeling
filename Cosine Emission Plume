@@ -1,0 +1,42 @@
+# Plot emission plumes in polar coordinates over -90° to +90°
+
+import numpy as np
+import matplotlib.pyplot as plt
+import os # Import the os module
+
+n_values = [0.5, 1, 2, 5, 10]
+phi = np.deg2rad(np.linspace(-90, 90, 1000))
+
+plt.figure(figsize=(7, 6))
+ax = plt.subplot(111, polar=True)
+
+# Store line objects and labels to create the legend later
+lines = []
+labels = []
+
+for n in n_values:
+    r = np.maximum(np.cos(phi), 0.0) ** n
+    # Plot the line and store the line object and label
+    line, = ax.plot(phi, r, label=f"n = {n:g}")
+    ax.plot(-phi, r, color=line.get_color()) # Use the same color for the symmetric part
+    lines.append(line)
+    labels.append(f"n = {n:g}")
+
+
+ax.set_theta_zero_location("N")
+ax.set_theta_direction(1)
+ax.set_thetalim(-np.pi/2, np.pi/2)
+
+ax.set_thetagrids(range(-90, 91, 30), labels=[f"{d}°" for d in range(-90, 91, 30)])
+ax.set_rlabel_position(135)
+
+# Create the legend using the stored line objects and labels
+ax.legend(lines, labels, loc="right", bbox_to_anchor=(1.3, 0.5))
+
+# Ensure the output directory exists before saving
+output_dir = "/mnt/data"
+os.makedirs(output_dir, exist_ok=True)
+
+out_path = os.path.join(output_dir, "figure1_emission_plumes_polar_fixed.png") # Use os.path.join for robustness
+plt.savefig(out_path, dpi=200, bbox_inches="tight")
+out_path
