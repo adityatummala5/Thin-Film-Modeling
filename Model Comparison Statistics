@@ -1,0 +1,156 @@
+import numpy as np
+import pandas as pd
+from scipy import stats
+import statsmodels.api as sm
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error
+
+# -----------------------------
+# Data (from your table)
+# -----------------------------
+data = pd.DataFrame({
+    "Actual": [
+        3.3, 7.3, 11.5, 16.4515, 17.3, 18, 18.8, 20, 33.6, 34,
+        40, 49.2, 52.8, 58, 74, 78, 85.4, 139.7, 432, 494.48
+    ],
+    "TraceApprox": [
+        4.52, 12.32, 20.53, 10.79, 2.96, 12.27, 18.97, 32.84, 5.92, 53.37,
+        16.82, 8.14, 9.62, 62.23, 59.38, 16.42, 93.30, 149.27, 462.51, 462.31
+    ],
+    "FSMS": [
+        2.64, 7.71, 12.86, 6.13, 7.83, 6.97, 10.81, 20.57, 15.65, 33.43,
+        9.78, 21.52, 25.44, 38.62, 36.79, 50.04, 62.55, 100.01, 303.79, 475.75
+    ]
+})
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def fit_and_metrics(y, x, name="Predictor", kfold_splits=5, random_state=42):
+    """
+    Fit y ~ 1 + x and compute correlation, regression, error metrics,
+    Bland-Altman, AIC/BIC, and 5-fold CV RMSE.
+    """
+    results = {"Predictor": name}
+
+    # Correlations
+    pearson_r, pearson_p = stats.pearsonr(x, y)
+    spearman_rho, spearman_p = stats.spearmanr(x, y)
+    results.update({
+        "Pearson_r": pearson_r, "Pearson_p": pearson_p,
+        "Spearman_rho": spearman_rho, "Spearman_p": spearman_p
+    })
+
+    # OLS regression (with intercept)
+    X = sm.add_constant(x)  # [const, x]
+    model = sm.OLS(y, X).fit()
+
+    intercept = model.params["const"]
+    slope = model.params[x.name]
+    ci = model.conf_int(alpha=0.05)
+    ci_intercept = tuple(ci.loc["const"])
+    ci_slope = tuple(ci.loc[x.name])
+
+    # Standard Error of Estimate (SEE): sqrt(SSE / (n - k)), k = 2 params
+    n = len(y)
+    k = 2
+    residuals = model.resid
+    sse = np.sum(residuals**2)
+    see = np.sqrt(sse / (n - k))
+
+    # Predictions & error metrics
+    y_pred = model.predict(X)
+    mae = np.mean(np.abs(y - y_pred))
+    rmse = np.sqrt(np.mean((y - y_pred) ** 2))
+    mbe = np.mean(y - y_pred)
+
+    # Bland–Altman stats: differences vs. means
+    diff = y - y_pred
+    mean_diff = np.mean(diff)
+    sd_diff = np.std(diff, ddof=1)
+    loa_low = mean_diff - 1.96 * sd_diff
+    loa_high = mean_diff + 1.96 * sd_diff
+
+    # AIC / BIC
+    aic = model.aic
+    bic = model.bic
+
+    # p-value for slope
+    p_slope = model.pvalues[x.name]
+
+    # 5-fold CV RMSE for linear model
+    kf = KFold(n_splits=kfold_splits, shuffle=True, random_state=random_state)
+    cv_rmses = []
+    X_full = X.values
+    y_full = y.values
+    for train_idx, test_idx in kf.split(X_full):
+        X_tr, X_te = X_full[train_idx], X_full[test_idx]
+        y_tr, y_te = y_full[train_idx], y_full[test_idx]
+        m_cv = sm.OLS(y_tr, X_tr).fit()
+        y_hat_te = m_cv.predict(X_te)
+        cv_rmses.append(np.sqrt(mean_squared_error(y_te, y_hat_te)))
+    cv_rmse = float(np.mean(cv_rmses))
+
+    # Collect results
+    results.update({
+        "Intercept": intercept,
+        "Intercept_CI_low": ci_intercept[0],
+        "Intercept_CI_high": ci_intercept[1],
+        "Slope": slope,
+        "Slope_CI_low": ci_slope[0],
+        "Slope_CI_high": ci_slope[1],
+        "Slope_p_value": p_slope,
+        "R_squared": model.rsquared,
+        "SEE": see,
+        "MAE": mae,
+        "RMSE": rmse,
+        "MBE": mbe,
+        "BlandAltman_mean_bias": mean_diff,
+        "BlandAltman_LOA_low": loa_low,
+        "BlandAltman_LOA_high": loa_high,
+        "AIC": aic,
+        "BIC": bic,
+        "CV5_RMSE": cv_rmse
+    })
+    return results
+
+# -----------------------------
+# Run for both predictors
+# -----------------------------
+trace_metrics = fit_and_metrics(
+    y=data["Actual"], x=data["TraceApprox"], name="Trace Approximation"
+)
+fsms_metrics = fit_and_metrics(
+    y=data["Actual"], x=data["FSMS"], name="FS-MS Total"
+)
+
+# -----------------------------
+# Present results
+# -----------------------------
+def fmt(d, keys):
+    return {k: (float(d[k]) if isinstance(d[k], (np.floating, np.float64, np.float32)) else d[k]) for k in keys}
+
+cols = [
+    "Predictor",
+    "Pearson_r", "Pearson_p",
+    "Spearman_rho", "Spearman_p",
+    "Intercept", "Intercept_CI_low", "Intercept_CI_high",
+    "Slope", "Slope_CI_low", "Slope_CI_high", "Slope_p_value",
+    "R_squared", "SEE", "MAE", "RMSE", "MBE",
+    "BlandAltman_mean_bias", "BlandAltman_LOA_low", "BlandAltman_LOA_high",
+    "AIC", "BIC", "CV5_RMSE"
+]
+
+summary_df = pd.DataFrame([
+    fmt(trace_metrics, cols),
+    fmt(fsms_metrics, cols)
+])[cols]
+
+pd.set_option("display.width", 160)
+pd.set_option("display.max_columns", None)
+print("\n=== Predictive Performance Summary ===")
+print(summary_df.to_string(index=False, justify="left"))
+
+# Optional: also save to CSV for the paper’s supplemental material
+summary_df.to_csv("model_performance_summary.csv", index=False)
+print("\nSaved: model_performance_summary.csv")
