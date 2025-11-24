@@ -1,0 +1,155 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+# =========================
+# Fixed geometry / model
+# =========================
+R_m = 0.05e-3      # 0.05 mm -> m
+D_m = 50e-3        # 50 mm  -> m
+L_m = 0.20         # 20 cm  -> m
+n   = 2.0
+
+# Peak constraint
+target_fmax_nm = 100
+target_fmax_m  = target_fmax_nm * 1e-9
+meters_to_nm   = 1e9
+
+csv_path_in  = "/mnt/data/mc_deposition_thickness_theta_x_PI_to_2PI.csv"
+csv_path_out = "/mnt/data/deposition_fit_prediction.csv"
+
+# =========================
+# Load simulation data
+# =========================
+df = pd.read_csv(csv_path_in)
+
+# Detect columns
+candidates_theta = [c for c in df.columns
+                    if c.lower() in {"theta","angle","theta_rad","theta_radians","theta_deg","theta_degrees"}
+                    or "theta" in c.lower() or "angle" in c.lower()]
+theta_col = candidates_theta[0] if candidates_theta else df.columns[0]
+
+candidates_thick = [c for c in df.columns
+                    if c.lower() in {"thickness","t","f","film","measured","height"}
+                    or "thick" in c.lower() or "meas" in c.lower() or "film" in c.lower()]
+if len(candidates_thick) == 0:
+    thick_col = df.columns[1]
+else:
+    cand = [c for c in candidates_thick if c != theta_col]
+    thick_col = cand[0] if len(cand) else candidates_thick[0]
+
+theta_raw = df[theta_col].to_numpy(dtype=float)
+y_sim_nm  = df[thick_col].to_numpy(dtype=float)  # keep same data column
+
+# Detect radians vs degrees
+def approx_between(xmin, xmax, a, b, tol=0.20):
+    width = b - a
+    return (xmin <= b + tol*width) and (xmax >= a - tol*width)
+
+theta_min, theta_max = float(np.nanmin(theta_raw)), float(np.nanmax(theta_raw))
+if approx_between(theta_min, theta_max, np.pi, 2*np.pi, tol=0.25):
+    theta = theta_raw.copy()
+elif approx_between(theta_min, theta_max, 180.0, 360.0, tol=0.25) or theta_max > (2*np.pi + 0.5):
+    theta = np.deg2rad(theta_raw)
+else:
+    theta = theta_raw.copy()
+
+mask = np.isfinite(theta) & np.isfinite(y_sim_nm) & (theta >= np.pi - 1e-6) & (theta <= 2*np.pi + 1e-6)
+theta     = theta[mask]
+y_sim_nm  = y_sim_nm[mask]
+order     = np.argsort(theta)
+theta     = theta[order]
+y_sim_nm  = y_sim_nm[order]
+
+# =========================
+# Model & Kt from f(3π/2)=100 nm
+# =========================
+def g_shape(theta, R, D, n):
+    sin_th = np.sin(theta)
+    r2 = R*R + D*D + 2.0*R*D*sin_th
+    r2 = np.clip(r2, 1e-24, None)
+    numer = (D + R*sin_th)**n * (-D * sin_th)
+    denom = np.power(r2, (n+3.0)/2.0)
+    return numer / denom
+
+theta_peak = 1.5 * np.pi
+g_peak = g_shape(theta_peak, R_m, D_m, n)
+if not np.isfinite(g_peak) or abs(g_peak) < 1e-30:
+    raise RuntimeError("g(theta=3π/2) degenerate; check R,D,n.")
+A_SI_m = target_fmax_m / g_peak  # Kt (meters)
+
+# --- Implied deposited volume & mass from A = Kt ---
+theta_fine = np.linspace(np.pi, 2*np.pi, 4097)
+G_int = np.trapz(g_shape(theta_fine, R_m, D_m, n), theta_fine)  # ∫ g(θ) dθ  [units: m^-2]
+V_deposit_m3 = A_SI_m * (L_m * R_m) * G_int                     # [m^3]
+
+# Convert to cm^3 and grams
+V_deposit_cm3 = V_deposit_m3 * 1e6
+gold_density_g_cm3 = 19.32
+mass_g = V_deposit_cm3 * gold_density_g_cm3
+
+print(f"[volume] ∫ g dθ = {G_int:.6e}  [m^3]")
+print(f"[volume] V_deposit = {V_deposit_m3:.6e} m^3  ({V_deposit_cm3:.6e} cm^3)")
+print(f"[mass]   m_gold ≈ {mass_g:.6e} g")
+
+# Theory thickness in nm
+y_theory_nm = (A_SI_m * g_shape(theta, R_m, D_m, n)) * meters_to_nm
+
+# =========================
+# Metrics (in nm)
+# =========================
+rmse = float(np.sqrt(np.mean((y_sim_nm - y_theory_nm)**2)))
+mae  = float(np.mean(np.abs(y_sim_nm - y_theory_nm)))
+var  = float(np.sum((y_sim_nm - np.mean(y_sim_nm))**2))
+r2   = 1.0 - float(np.sum((y_sim_nm - y_theory_nm)**2) / var) if var > 0 else np.nan
+
+print(f"[cols] theta='{theta_col}', thickness='{thick_col}'")
+print(f"[Kt] A=Kt (meters): {A_SI_m:.6e}")
+print(f"[fit] RMSE={rmse:.6g} nm, MAE={mae:.6g} nm, R^2={r2:.6g}")
+
+# =========================
+# Save CSV (nm)
+# =========================
+out_df = pd.DataFrame({
+    "theta_rad": theta,
+    "theta_deg": np.rad2deg(theta),
+    "sim_thickness_nm": y_sim_nm,
+    "predicted_thickness_nm": y_theory_nm
+})
+out_df.to_csv(csv_path_out, index=False)
+print(f"Saved predictions to: {csv_path_out}")
+
+# =========================
+# Plot (nm) — radians on x-axis
+# =========================
+fig, ax = plt.subplots(figsize=(7.5, 5.2))
+
+# Plot simulation first, then theory (red line on top)
+ax.scatter(theta, y_sim_nm, s=14, alpha=0.65, label="Simulated", color="steelblue")
+ax.plot(theta, y_theory_nm, linewidth=2.25, color="red", label="Theory", zorder=10)
+
+ax.set_xlabel(r"$\theta$ (radians)")
+ax.set_ylabel("Thickness (nm)")
+ax.set_title("Deposition Profile: Simulation vs. Theory")
+ax.grid(True, linestyle="--", alpha=0.4)
+ax.legend(frameon=False)
+
+# π-based ticks from π to 2π (use \frac, not \tfrac)
+ax.set_xlim(np.pi, 2*np.pi)
+ax.set_xticks([np.pi, 1.5*np.pi, 2*np.pi])
+ax.set_xticklabels([r"$\pi$", r"$\frac{3\pi}{2}$", r"$2\pi$"])
+
+# Simplify look
+for spine in ("top", "right"):
+    ax.spines[spine].set_visible(False)
+ax.yaxis.set_major_locator(mticker.MaxNLocator(6))
+
+# Annotation
+text = f"R² = {r2:.2g}"
+ax.text(0.02, 0.98, text, transform=ax.transAxes,
+        va="top", ha="left", fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.35", alpha=0.10))
+
+plt.tight_layout()
+plt.show()
