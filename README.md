@@ -3,10 +3,7 @@ This repository aims to lower barriers to precision modeling of anisotropic depo
 ## Overview
 This repository provides an **open-access framework** for modeling anisotropic physical vapor deposition (PVD) on cylindrical and wire-like substrates and predicting the resulting electrical resistance. It includes:
 
-- **First-principles geometric model** for anisotropic flux: generalized pseudo-Lambertian emission  
-  \[
-  \cos^n(\psi)
-  \]
+- **First-principles geometric model** for anisotropic flux: generalized pseudo-Lambertian emission  cos^n(psi)
   mapped to cylindrical coordinates.
 
 - **Closed-form resistance model** integrating **Fuchs–Sondheimer** (surface scattering) and **Mayadas–Shatzkes** (grain-boundary scattering) corrections.
