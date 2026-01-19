@@ -12,7 +12,7 @@ from scipy.ndimage import gaussian_filter
 # Cylinder (axis along X)
 cylinder_center = np.array([0.0, 0.0, 50.0])   # [mm]
 cylinder_length = 20.0                         # [mm]
-cylinder_radius = 0.1                          # [mm]  <-- wire radius = 100 µm = 0.1 mm
+cylinder_radius = 0.1                          # [mm] 
 
 # Directionality exponent
 n = 2
@@ -88,10 +88,6 @@ print(f"[setup] N_total per ratio: {[N_total_map[r] for r in R_over_D_list]}")
 print(f"[debug] Gold per-atom volume V_atom_m3 = {V_atom_m3:.3e} m^3/atom")
 print(f"[output] CSV directory: {out_dir}")
 
-# =========================
-# Helper: run one Monte Carlo case and return x=0 slice thickness vs theta
-# Also saves a CSV per case.
-# =========================
 def run_case_for_D(D_mm: float, r_over_d: float, N_total_3d_case: int):
     source_3d = np.array([0.0, -D_mm, cylinder_center[2]])
 
