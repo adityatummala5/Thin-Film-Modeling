@@ -1,0 +1,139 @@
+# SENSITIVITY ANALYSIS
+
+import numpy as np
+import pandas as pd
+
+
+def g_shape(theta, R, D, n):
+    sin_th = np.sin(theta)
+    r2 = R*R + D*D + 2.0*R*D*sin_th
+    r2 = np.clip(r2, 1e-24, None)
+    numer = (D + R*sin_th)**n * (-D * sin_th)
+    denom = np.power(r2, (n+3.0)/2.0)
+    return numer / denom
+
+def K_from_fmax(fmax_nm, R, D, n):
+    theta_peak = 1.5 * np.pi
+    g_peak = g_shape(theta_peak, R, D, n)
+    return (fmax_nm * 1e-9) / g_peak
+
+def F_alpha(l0, r_gb, a_g):
+    alpha = (l0 * r_gb) / (a_g * (1 - r_gb))
+    return (
+        1
+        - 1.5 * alpha
+        + 3 * alpha**2
+        - 3 * alpha**3 * np.log(1 + 1/alpha)
+    )
+
+def T_adj(alpha_tcr, T_amb):
+    return 1.0 + alpha_tcr * (T_amb - 25.0)
+
+def R_cyl(params):
+    L   = params["L_cyl"]
+    rho = params["rho_0"]
+    R   = params["R"]
+    D   = params["D"]
+    K   = params["K"]
+    t   = params["t"]           
+    l0  = params["l_0"]
+    P   = params["P"]
+    r_gb= params["r_gb"]
+    a_g = params["a_g"]
+    T_amb = params["T_amb"]
+    alpha_tcr = params["alpha_tcr"]  
+
+    F = F_alpha(l0, r_gb, a_g)
+    Tcorr = T_adj(alpha_tcr, T_amb)
+    geom = 1 + (3 * np.pi * R) / (4 * D)
+    
+    dep_factor = (2.0 * K * t) / (D**2)
+
+    return (L * rho * Tcorr) / (
+        R * (F * dep_factor * geom - ((3 - 3*P)/8.0)*np.pi*l0)
+    )
+
+baseline = {
+    "L_cyl": 0.02,        # m
+    "rho_0": 2.44e-8,     # ohm·m
+    "R": 100e-6,          # m
+    "D": 0.20,            # m
+    "t": 1.0,             # 
+    "l_0": 3.0e-8,        # m
+    "P": 0.1,
+    "r_gb": 0.3,
+    "a_g": 1.0e-7,        # m
+    "T_amb": 20,          # °C
+    "alpha_tcr": 0.0039   # 1/°C 
+}
+
+n = 2.0
+fmax_nm_baseline = 100.0
+
+baseline["K"] = K_from_fmax(
+    fmax_nm_baseline,
+    baseline["R"],
+    baseline["D"],
+    n
+)
+
+R0 = R_cyl(baseline)
+
+
+delta_map = {
+    "L_cyl": 0.02,      # ±2%
+    "rho_0": 0.25,      # ±25%
+    "R": 0.05,          # ±5%
+    "D": 0.02,          # ±2%
+    "t": 0.05,          # ±5%
+    "l_0": 0.1283,      # ±12.83%
+    "P": 2.10,          # 210%
+    "r_gb": 0.20,       # ±20%
+    "a_g": 0.15,        # ±15%
+    "T_amb": 0.04,      # ±4%
+    "alpha_tcr": 0.0463,  # 4.63%
+    "f_max_nm": 0.05    # ±5%
+}
+
+def full_sensitivity(baseline_params, fmax_nm_baseline, delta_map):
+    results = []
+    param_list = list(baseline_params.keys()) + ["f_max_nm"]
+
+    for param in param_list:
+        delta_frac = delta_map.get(param, 0.0)
+        if delta_frac == 0.0:
+            continue
+
+        for sign in (-1, +1):
+            params_mod = baseline_params.copy()
+            fmax_nm = fmax_nm_baseline
+
+            if param == "f_max_nm":
+                fmax_nm *= (1 + sign * delta_frac)
+            else:
+                params_mod[param] *= (1 + sign * delta_frac)
+
+            # Recalibrate K from fmax every time R or D or fmax changes (as before)
+            params_mod["K"] = K_from_fmax(
+                fmax_nm,
+                params_mod["R"],
+                params_mod["D"],
+                n
+            )
+
+            R_new = R_cyl(params_mod)
+            dR_pct = 100 * (R_new - R0) / R0
+
+            results.append({
+                "Parameter": param,
+                "Perturbation": f"{sign*delta_frac*100:+.1f}%",
+                "ΔR_total (%)": dR_pct
+            })
+
+    return pd.DataFrame(results)
+
+df_sens = full_sensitivity(baseline, fmax_nm_baseline, delta_map)
+display(df_sens)
+
+df_sens.to_csv("full_sensitivity_custom_percent.csv", index=False)
+print("Saved: full_sensitivity_custom_percent.csv")
