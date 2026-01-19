@@ -1,0 +1,312 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from scipy.ndimage import gaussian_filter
+
+# =========================
+# Geometry & parameters
+# =========================
+
+# Cylinder (axis along X)
+cylinder_center = np.array([0.0, 0.0, 50.0])   # [mm]
+cylinder_length = 20.0                         # [mm]
+cylinder_radius = 0.1                          # [mm]  <-- wire radius = 100 µm = 0.1 mm
+
+# Directionality exponent
+n = 2
+
+# Chunking / RNG
+chunk_size = 25_000_000
+rng = np.random.default_rng(7)
+
+# Sticking Probability
+sticking_S = 1.0
+
+# Material Parameters (Au)
+M_kg_per_mol = 0.19696657
+rho_kg_per_m3 = 19320.0
+N_A = 6.02214076e23
+V_atom_m3 = (M_kg_per_mol / rho_kg_per_m3) / N_A
+
+# Calibration: enforce 100 nm at (θ=3π/2, x=0) neighborhood average
+calibrate_to_reference = True
+reference_thickness_nm = 100.0
+
+# Peak neighborhood settings
+peak_avg_halfwidth_theta = 1
+peak_avg_halfwidth_x = 1
+include_center_in_peak_avg = False
+
+# Binning
+n_theta_bins = 72
+n_x_bins = 60
+theta_bins = np.linspace(np.pi, 2*np.pi, n_theta_bins + 1)
+x_bins = np.linspace(-cylinder_length/2.0, cylinder_length/2.0, n_x_bins + 1)
+
+theta_centers = 0.5 * (theta_bins[:-1] + theta_bins[1:])
+x_centers     = 0.5 * (x_bins[:-1] + x_bins[1:])
+
+# Reference bin indices for θ=3π/2 and x=0
+target_theta = 1.5 * np.pi
+target_x = 0.0
+
+theta_idx = np.searchsorted(theta_bins, target_theta, side="right") - 1
+theta_idx = int(np.clip(theta_idx, 0, len(theta_bins) - 2))
+
+x_idx = np.searchsorted(x_bins, target_x, side="right") - 1
+x_idx = int(np.clip(x_idx, 0, len(x_bins) - 2))
+
+# Cylinder x-extent (in cylinder-centered coords)
+x_min_cyl_rel = -cylinder_length / 2.0
+x_max_cyl_rel =  cylinder_length / 2.0
+
+# Target R/D ratios (dimensionless) to simulate
+R_over_D_list = [1.0e-1, 2.0e-2, 1.0e-2, 2.0e-3]
+
+# Per-ratio total rays
+N_total_map = {
+    1.0e-1: 500_000_000,
+    2.0e-2: 1_000_000_000,
+    1.0e-2: 2_000_000_000,
+    2.0e-3: 5_000_000_000,
+}
+
+# Convert to D values (mm): D = R / (R/D)
+R_mm = cylinder_radius
+D_list_mm = [R_mm / r for r in R_over_D_list]
+
+# Output directory for CSVs
+out_dir = "/mnt/data"
+os.makedirs(out_dir, exist_ok=True)
+
+print(f"[setup] wire radius R = {R_mm} mm (100 µm)")
+print(f"[setup] R/D ratios: {R_over_D_list}")
+print(f"[setup] D values (mm): {D_list_mm}")
+print(f"[setup] N_total per ratio: {[N_total_map[r] for r in R_over_D_list]}")
+print(f"[debug] Gold per-atom volume V_atom_m3 = {V_atom_m3:.3e} m^3/atom")
+print(f"[output] CSV directory: {out_dir}")
+
+# =========================
+# Helper: run one Monte Carlo case and return x=0 slice thickness vs theta
+# Also saves a CSV per case.
+# =========================
+def run_case_for_D(D_mm: float, r_over_d: float, N_total_3d_case: int):
+    source_3d = np.array([0.0, -D_mm, cylinder_center[2]])
+
+    # Source position relative to cylinder center
+    S_rel = source_3d - cylinder_center
+    Sx_rel, Sy_rel, Sz_rel = S_rel
+
+    counts = np.zeros((n_theta_bins, n_x_bins), dtype=float)
+
+    print("\n=========================")
+    print(f"Running case: D = {D_mm:g} mm  |  R/D = {r_over_d:.1e}")
+    print(f"Source position: {source_3d}")
+    print(f"Tracing {N_total_3d_case:,} rays in chunks of {chunk_size:,} ...")
+
+    for i0 in range(0, N_total_3d_case, chunk_size):
+        N_chunk = min(chunk_size, N_total_3d_case - i0)
+        print(f"  Chunk starting at {i0:,}  (N={N_chunk:,})")
+
+        # Sampling directions from cos^n(psi) hemisphere about +y
+        U = rng.random(N_chunk)
+        cos_psi = U ** (1.0 / (n + 1.0))
+        sin_psi = np.sqrt(np.maximum(0.0, 1.0 - cos_psi**2))
+        alpha = 2.0 * np.pi * rng.random(N_chunk)
+
+        dx = sin_psi * np.cos(alpha)
+        dy = cos_psi
+        dz = sin_psi * np.sin(alpha)
+
+        # Finite cylinder x-limits
+        t_x1 = np.full(N_chunk, np.nan)
+        t_x2 = np.full(N_chunk, np.nan)
+        not_parallel_to_x = ~np.isclose(dx, 0.0)
+        t_x1[not_parallel_to_x] = (x_min_cyl_rel - Sx_rel) / dx[not_parallel_to_x]
+        t_x2[not_parallel_to_x] = (x_max_cyl_rel - Sx_rel) / dx[not_parallel_to_x]
+
+        t_x_enter = np.full(N_chunk, -np.inf)
+        t_x_exit  = np.full(N_chunk,  np.inf)
+        t_x_enter[not_parallel_to_x] = np.minimum(t_x1[not_parallel_to_x], t_x2[not_parallel_to_x])
+        t_x_exit[not_parallel_to_x]  = np.maximum(t_x1[not_parallel_to_x], t_x2[not_parallel_to_x])
+
+        parallel_to_x = ~not_parallel_to_x
+        outside_x_bounds_parallel_x = parallel_to_x & ((Sx_rel < x_min_cyl_rel) | (Sx_rel > x_max_cyl_rel))
+
+        # Infinite cylinder in yz: y^2 + z^2 = R^2
+        a = dy**2 + dz**2
+        b = 2.0 * (Sy_rel * dy + Sz_rel * dz)
+        c = Sy_rel**2 + Sz_rel**2 - cylinder_radius**2
+
+        parallel_to_yz = np.isclose(a, 0.0)
+
+        t1_inf = np.full(N_chunk, np.nan)
+        t2_inf = np.full(N_chunk, np.nan)
+
+        not_parallel_to_yz = ~parallel_to_yz
+        disc = b**2 - 4.0 * a * c
+        valid_disc_mask = not_parallel_to_yz & (disc >= 0.0)
+
+        sqrt_disc = np.sqrt(disc[valid_disc_mask])
+        t1_inf[valid_disc_mask] = (-b[valid_disc_mask] - sqrt_disc) / (2.0 * a[valid_disc_mask])
+        t2_inf[valid_disc_mask] = (-b[valid_disc_mask] + sqrt_disc) / (2.0 * a[valid_disc_mask])
+
+        # Rays parallel to yz (a~0): along x
+        dist_to_axis_sq_yz = Sy_rel**2 + Sz_rel**2
+        within_radius_yz_parallel_yz = parallel_to_yz & (dist_to_axis_sq_yz <= cylinder_radius**2)
+        valid_parallel_yz_hit = within_radius_yz_parallel_yz & ~outside_x_bounds_parallel_x
+        t1_inf[valid_parallel_yz_hit] = np.maximum(0.0, t_x_enter[valid_parallel_yz_hit])
+
+        # Intersect with finite x-interval
+        valid_t1_mask = (t1_inf >= 0.0) & (t1_inf >= t_x_enter) & (t1_inf <= t_x_exit)
+        valid_t2_mask = (t2_inf >= 0.0) & (t2_inf >= t_x_enter) & (t2_inf <= t_x_exit)
+
+        t_hit = np.full(N_chunk, np.nan)
+        t_hit[valid_t1_mask & ~valid_t2_mask] = t1_inf[valid_t1_mask & ~valid_t2_mask]
+        t_hit[valid_t2_mask & ~valid_t1_mask] = t2_inf[valid_t2_mask & ~valid_t1_mask]
+        both_valid_mask = valid_t1_mask & valid_t2_mask
+        t_hit[both_valid_mask] = np.minimum(t1_inf[both_valid_mask], t2_inf[both_valid_mask])
+
+        t_hit[outside_x_bounds_parallel_x] = np.nan
+
+        hit_mask = ~np.isnan(t_hit)
+        if not np.any(hit_mask):
+            continue
+
+        dxh = dx[hit_mask]
+        dyh = dy[hit_mask]
+        dzh = dz[hit_mask]
+        th  = t_hit[hit_mask]
+
+        impact_points = source_3d + np.column_stack((dxh, dyh, dzh)) * th[:, None]
+
+        rel = impact_points - cylinder_center
+        x_hit = rel[:, 0]
+        y_rel = rel[:, 1]
+        z_rel = rel[:, 2]
+
+        theta_hit = np.arctan2(y_rel, z_rel)
+        theta_hit_02pi = np.where(theta_hit < 0, theta_hit + 2*np.pi, theta_hit)
+
+        mtheta = (theta_hit_02pi >= np.pi) & (theta_hit_02pi <= 2*np.pi)
+        if not np.any(mtheta):
+            continue
+
+        theta_use = theta_hit_02pi[mtheta]
+        x_use = x_hit[mtheta]
+
+        h2, _, _ = np.histogram2d(theta_use, x_use, bins=[theta_bins, x_bins])
+        counts += h2
+
+    print(f"Total hits accumulated (all bins): {int(np.sum(counts)):,}")
+
+    # Bin areas
+    dtheta = np.diff(theta_bins)
+    dxbin  = np.diff(x_bins)
+    A_bin_mm2 = cylinder_radius * dtheta[:, None] * dxbin[None, :]
+    A_bin_m2  = A_bin_mm2 * 1e-6
+
+    # -------------------------
+    # Calibration to 100 nm at (theta=3pi/2, x=0) neighborhood average
+    # -------------------------
+    atoms_per_ray = 1.0
+    if calibrate_to_reference:
+        th0 = max(theta_idx - peak_avg_halfwidth_theta, 0)
+        th1 = min(theta_idx + peak_avg_halfwidth_theta + 1, counts.shape[0])
+        x0  = max(x_idx     - peak_avg_halfwidth_x,      0)
+        x1  = min(x_idx     + peak_avg_halfwidth_x + 1,  counts.shape[1])
+
+        window_counts = counts[th0:th1, x0:x1].astype(float).copy()
+        window_area   = A_bin_m2[th0:th1, x0:x1].astype(float).copy()
+
+        if not include_center_in_peak_avg:
+            cth = theta_idx - th0
+            cx  = x_idx - x0
+            if 0 <= cth < window_counts.shape[0] and 0 <= cx < window_counts.shape[1]:
+                window_counts[cth, cx] = 0.0
+                window_area[cth, cx]   = 0.0
+
+        hits_sum = float(np.nansum(window_counts))
+        area_sum = float(np.nansum(window_area))
+
+        if hits_sum <= 0.0 or area_sum <= 0.0:
+            N_hits_ref = counts[theta_idx, x_idx]
+            if N_hits_ref <= 0:
+                raise RuntimeError("Calibration failed: no hits in reference region or center bin.")
+            t_ref_m  = reference_thickness_nm * 1e-9
+            A_ref_m2 = A_bin_m2[theta_idx, x_idx]
+            atoms_per_ray = (t_ref_m * A_ref_m2) / (sticking_S * V_atom_m3 * N_hits_ref)
+            print(f"[calibration:center] atoms_per_ray = {atoms_per_ray:.6e}")
+        else:
+            t_ref_m = reference_thickness_nm * 1e-9
+            atoms_per_ray = t_ref_m / (sticking_S * V_atom_m3 * (hits_sum / area_sum))
+            used_bins = int(np.count_nonzero(window_area))
+            print(f"[calibration:neighbors] Using {used_bins} bins around θ=3π/2, x=0")
+            print(f"  atoms_per_ray = {atoms_per_ray:.6e}")
+
+    # Convert counts -> thickness
+    counts_physical = counts * atoms_per_ray
+    atoms_per_m2 = counts_physical / A_bin_m2
+    thickness_m  = sticking_S * atoms_per_m2 * V_atom_m3
+    thickness_nm = thickness_m * 1e9
+
+    # Extract x=0 slice (average over x neighbors)
+    x0  = max(x_idx - peak_avg_halfwidth_x, 0)
+    x1  = min(x_idx + peak_avg_halfwidth_x + 1, thickness_nm.shape[1])
+    slice_nm = np.nanmean(thickness_nm[:, x0:x1], axis=1)
+
+    # Optional smoothing
+    plot_sigma_theta = 0
+    if plot_sigma_theta and plot_sigma_theta > 0:
+        slice_nm = gaussian_filter(slice_nm, sigma=plot_sigma_theta)
+
+    # Save CSV for this case
+    csv_path = os.path.join(out_dir, f"mc_slice_x0_RD_{r_over_d:.1e}.csv")
+    pd.DataFrame({
+        "theta_center_rad": theta_centers,
+        "theta_center_deg": np.rad2deg(theta_centers),
+        "thickness_nm_x0_slice": slice_nm,
+        "R_over_D": np.full_like(theta_centers, r_over_d, dtype=float),
+        "D_mm": np.full_like(theta_centers, D_mm, dtype=float),
+        "N_total_rays": np.full_like(theta_centers, float(N_total_3d_case), dtype=float),
+    }).to_csv(csv_path, index=False)
+    print(f"[output] Saved x=0 slice CSV to: {csv_path}")
+
+    print(f"[slice] max thickness along x≈0: {float(np.nanmax(slice_nm)):.3f} nm")
+    return theta_centers, slice_nm, csv_path
+
+
+# =========================
+# Run all ratios and plot + export CSVs
+# =========================
+fig, ax = plt.subplots(figsize=(8.0, 5.4))
+saved_csvs = []
+
+for r_over_d, D_mm in zip(R_over_D_list, D_list_mm):
+    N_case = int(N_total_map[r_over_d])
+    th, slice_nm, csv_path = run_case_for_D(D_mm, r_over_d, N_case)
+    saved_csvs.append(csv_path)
+    ax.plot(th, slice_nm, linewidth=2.0, label=rf"$R/D = {r_over_d:.1e}$")
+
+ax.set_xlabel(r"$\theta$ (radians)")
+ax.set_ylabel("Thickness (nm)")
+ax.set_title("MC Simulation for Varying $R/D$ Ratios (x≈0 slice)")
+ax.grid(True, linestyle="--", alpha=0.4)
+ax.legend(frameon=False, ncols=2)
+
+ax.set_xlim(np.pi, 2*np.pi)
+ax.set_xticks([np.pi, 1.5*np.pi, 2*np.pi])
+ax.set_xticklabels([r"$\pi$", r"$\frac{3\pi}{2}$", r"$2\pi$"])
+
+for spine in ("top", "right"):
+    ax.spines[spine].set_visible(False)
+ax.yaxis.set_major_locator(mticker.MaxNLocator(6))
+
+plt.tight_layout()
+plt.show()
+
+print("\nSaved CSV files:")
+for p in saved_csvs:
+    print("  -", p)
